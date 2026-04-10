@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import math
 import numpy as np
-from statistics import NormalDist
+from scipy.stats import chi2
 
 from pmtree import PMTree
 
@@ -20,17 +20,15 @@ class QueryStats:
 
 class PMLSH:
     """
-    PM-LSH style ANN index.
+    PM-LSH-style ANN index.
 
-    Core paper-aligned ingredients:
-    1) project data into an m-dimensional space using stable Gaussian projections
-    2) index projected points with a PM-tree
-    3) use the chi-square confidence interval relationship between projected and
-       original distances to convert original-space radii into projected-space radii
-    4) answer (c, k)-ANN by repeated projected-space range expansion
+    This version is intentionally stricter than the earlier prototype:
+    - uses scipy's chi-square quantiles instead of a loose approximation
+    - keeps beta small by default so the search stays genuinely approximate
+    - estimates r_min from sampled k-NN radii rather than random pairwise distances
+    - allows multiple projected-space expansions before exact reranking
 
-    This is a faithful research-style reimplementation of the framework, but it is
-    not an official reproduction of the paper's exact C++ codebase.
+    It is still a research-style Python reimplementation, not the original C++ code.
     """
 
     def __init__(
@@ -39,10 +37,15 @@ class PMLSH:
         n_pivots: int = 5,
         c: float = 1.5,
         alpha1: float = 1 / math.e,
+        alpha2: Optional[float] = None,
         beta: Optional[float] = None,
+        beta_cap: float = 0.10,
         max_leaf_size: int = 32,
         max_internal_size: int = 16,
         random_state: int = 42,
+        rmin_sample_size: int = 192,
+        rmin_quantile: float = 0.35,
+        max_expansions: int = 8,
     ) -> None:
         self.m = int(m)
         self.n_pivots = int(n_pivots)
@@ -52,9 +55,18 @@ class PMLSH:
         self.rng = np.random.default_rng(random_state)
         self.max_leaf_size = int(max_leaf_size)
         self.max_internal_size = int(max_internal_size)
+        self.beta_cap = float(beta_cap)
+        self.rmin_sample_size = int(rmin_sample_size)
+        self.rmin_quantile = float(rmin_quantile)
+        self.max_expansions = int(max_expansions)
 
-        self.alpha2 = self._solve_alpha2(self.m, self.c, self.alpha1)
-        self.beta = float(beta) if beta is not None else float(max(2 * self.alpha2, 1e-4))
+        self.alpha2 = float(alpha2) if alpha2 is not None else self._solve_alpha2(self.m, self.c, self.alpha1)
+        derived_beta = max(2.0 * self.alpha2, 1e-4)
+        if beta is None:
+            self.beta = float(min(derived_beta, self.beta_cap))
+        else:
+            self.beta = float(beta)
+
         self.t = float(math.sqrt(self._chi2_upper_quantile(self.m, self.alpha1)))
 
         self.X: Optional[np.ndarray] = None
@@ -63,26 +75,31 @@ class PMLSH:
         self.X_proj: Optional[np.ndarray] = None
         self.pivots: Optional[np.ndarray] = None
         self.tree: Optional[PMTree] = None
-        self.distance_distribution: Optional[np.ndarray] = None
+        self.sample_knn_radii: Optional[np.ndarray] = None
 
     @staticmethod
     def _chi2_upper_quantile(df: int, alpha: float) -> float:
-        # Wilson-Hilferty approximation.
-        z = NormalDist().inv_cdf(1.0 - alpha)
-        return float(df * (1.0 - 2.0 / (9.0 * df) + z * math.sqrt(2.0 / (9.0 * df))) ** 3)
+        return float(chi2.isf(alpha, df))
 
     def _solve_alpha2(self, m: int, c: float, alpha1: float) -> float:
+        """
+        Solve Equation (10) from the PM-LSH paper exactly.
+
+            t^2 = chi2_{alpha1}(m) = c^2 * chi2_{1-alpha2}(m)
+
+        The paper defines chi2_a(m) as the *upper-tail* quantile, so:
+            chi2_{1-alpha2}(m) = ppf(alpha2; m)
+
+        Therefore:
+            alpha2 = CDF( chi2_{alpha1}(m) / c^2 ; m )
+
+        This closed form is both simpler and more numerically stable than the
+        earlier binary search, and it avoids the previous direction bug that
+        incorrectly drove alpha2 toward 1.
+        """
         target = self._chi2_upper_quantile(m, alpha1)
-        lo, hi = 1e-9, 0.49
-        for _ in range(80):
-            mid = 0.5 * (lo + hi)
-            lhs = target
-            rhs = (c ** 2) * self._chi2_upper_quantile(m, 1.0 - mid)
-            if rhs > lhs:
-                lo = mid
-            else:
-                hi = mid
-        return 0.5 * (lo + hi)
+        alpha2 = float(chi2.cdf(target / (c ** 2), m))
+        return min(max(alpha2, 1e-12), 1.0 - 1e-12)
 
     def _project(self, X: np.ndarray) -> np.ndarray:
         if self.projection_matrix is None:
@@ -98,15 +115,13 @@ class PMLSH:
 
         pivot_ids = self._choose_pivots(self.X_proj, self.n_pivots)
         self.pivots = self.X_proj[pivot_ids]
-        self.tree = PMTree(self.pivots, max_leaf_size=self.max_leaf_size, max_internal_size=self.max_internal_size)
+        self.tree = PMTree(
+            self.pivots,
+            max_leaf_size=self.max_leaf_size,
+            max_internal_size=self.max_internal_size,
+        )
         self.tree.build(self.X_proj)
-
-        # sample original-space distance distribution to estimate r_min as in the paper
-        sample_size = min(2000, n)
-        ids_a = self.rng.integers(0, n, size=sample_size)
-        ids_b = self.rng.integers(0, n, size=sample_size)
-        dists = np.linalg.norm(self.X[ids_a] - self.X[ids_b], axis=1)
-        self.distance_distribution = np.sort(dists)
+        self.sample_knn_radii = self._sample_knn_radii(k=10)
         return self
 
     def _choose_pivots(self, X_proj: np.ndarray, n_pivots: int) -> np.ndarray:
@@ -121,16 +136,41 @@ class PMLSH:
             min_d = np.minimum(min_d, d)
         return np.array(chosen, dtype=np.int32)
 
-    def _estimate_r_min(self, k: int) -> float:
-        if self.distance_distribution is None or self.X is None:
+    def _sample_knn_radii(self, k: int) -> np.ndarray:
+        if self.X is None:
             raise ValueError("Model not fit")
         n = self.X.shape[0]
-        target_rank = min(len(self.distance_distribution) - 1, max(1, int((self.beta * n + k) / max(n, 1) * len(self.distance_distribution))))
-        r = float(self.distance_distribution[target_rank])
-        return max(r * 0.9, 1e-8)
+        sample_size = min(self.rmin_sample_size, n)
+        ids = self.rng.choice(n, size=sample_size, replace=False)
+        radii = []
+        for idx in ids:
+            q = self.X[idx]
+            dists = np.linalg.norm(self.X - q, axis=1)
+            kth = np.partition(dists, min(k, len(dists) - 1))[min(k, len(dists) - 1)]
+            radii.append(float(kth))
+        return np.sort(np.asarray(radii, dtype=np.float32))
+
+    def _estimate_r_min(self, k: int) -> float:
+        if self.sample_knn_radii is None:
+            raise ValueError("Model not fit")
+        # Start from a conservative local-neighborhood scale, not random pairwise distances.
+        idx = min(len(self.sample_knn_radii) - 1, max(0, int(self.rmin_quantile * len(self.sample_knn_radii))))
+        base = float(self.sample_knn_radii[idx])
+        scale = max(1.0, math.sqrt(max(k, 1) / 10.0))
+        return max(base * scale, 1e-8)
 
     def _projected_range_radius(self, original_radius: float) -> float:
         return self.t * original_radius
+
+    def _finalize(self, q: np.ndarray, candidate_ids: List[int], k: int, stats: QueryStats) -> Tuple[np.ndarray, np.ndarray, QueryStats]:
+        if self.X is None:
+            raise ValueError("Index not fit")
+        if not candidate_ids:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.float32), stats
+        candidate_arr = np.array(candidate_ids, dtype=np.int32)
+        dists = np.linalg.norm(self.X[candidate_arr] - q, axis=1)
+        order = np.argsort(dists)[:k]
+        return candidate_arr[order], dists[order], stats
 
     def query_ckann(self, q: np.ndarray, k: int = 1) -> Tuple[np.ndarray, np.ndarray, QueryStats]:
         if self.tree is None or self.X is None or self.X_proj is None:
@@ -142,24 +182,13 @@ class PMLSH:
         n_required = int(math.ceil(self.beta * len(self.X) + k))
 
         candidate_ids: List[int] = []
-        seen = set()
+        seen: set[int] = set()
         expansions = 0
         last_proj_radius = 0.0
+        best_ids = np.array([], dtype=np.int32)
+        best_dists = np.array([], dtype=np.float32)
 
-        while True:
-            # termination condition using original-space verification
-            if candidate_ids:
-                dists = np.linalg.norm(self.X[candidate_ids] - q, axis=1)
-                within = np.sum(dists <= self.c * r)
-                if within >= k:
-                    order = np.argsort(dists)[:k]
-                    chosen_ids = np.array(candidate_ids, dtype=np.int32)[order]
-                    return (
-                        chosen_ids,
-                        dists[order],
-                        QueryStats(last_proj_radius, r, len(candidate_ids), self.tree.n_distance_computations, expansions),
-                    )
-
+        while expansions < self.max_expansions:
             last_proj_radius = self._projected_range_radius(r)
             hits = self.tree.range_query(q_proj, last_proj_radius)
             for idx in hits:
@@ -168,24 +197,31 @@ class PMLSH:
                     candidate_ids.append(idx)
 
             expansions += 1
-            if len(candidate_ids) >= n_required:
-                dists = np.linalg.norm(self.X[candidate_ids] - q, axis=1)
-                order = np.argsort(dists)[:k]
-                chosen_ids = np.array(candidate_ids, dtype=np.int32)[order]
-                return (
-                    chosen_ids,
-                    dists[order],
-                    QueryStats(last_proj_radius, r, len(candidate_ids), self.tree.n_distance_computations, expansions),
-                )
+            stats = QueryStats(
+                projected_radius=last_proj_radius,
+                original_radius=r,
+                candidates_found=len(candidate_ids),
+                distance_computations=self.tree.n_distance_computations,
+                expansions=expansions,
+            )
+
+            if candidate_ids:
+                best_ids, best_dists, _ = self._finalize(q, candidate_ids, k, stats)
+                within = int(np.sum(best_dists <= self.c * r))
+                if len(candidate_ids) >= n_required or within >= k:
+                    return best_ids, best_dists, stats
 
             r *= self.c
-            if r > float(np.max(self.distance_distribution) * 4.0):
-                dists = np.linalg.norm(self.X[candidate_ids] - q, axis=1) if candidate_ids else np.array([])
-                if len(dists) == 0:
-                    return np.array([], dtype=np.int32), np.array([], dtype=np.float32), QueryStats(last_proj_radius, r, 0, self.tree.n_distance_computations, expansions)
-                order = np.argsort(dists)[:k]
-                chosen_ids = np.array(candidate_ids, dtype=np.int32)[order]
-                return chosen_ids, dists[order], QueryStats(last_proj_radius, r, len(candidate_ids), self.tree.n_distance_computations, expansions)
+
+        # fallback after exhausting expansions
+        final_stats = QueryStats(
+            projected_radius=last_proj_radius,
+            original_radius=r,
+            candidates_found=len(candidate_ids),
+            distance_computations=self.tree.n_distance_computations,
+            expansions=expansions,
+        )
+        return self._finalize(q, candidate_ids, k, final_stats)
 
     def batch_query_ckann(self, Q: np.ndarray, k: int = 1) -> Dict[str, object]:
         ids_all = []

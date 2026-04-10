@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 import time
-from dataclasses import asdict
 from typing import Dict, List
 
 import matplotlib.pyplot as plt
@@ -30,8 +29,17 @@ def evaluate_one_config(
     k,
     n_queries,
     random_state,
+    beta_cap,
+    rmin_quantile,
 ):
-    model = PMLSH(m=m, n_pivots=n_pivots, c=c, random_state=random_state)
+    model = PMLSH(
+        m=m,
+        n_pivots=n_pivots,
+        c=c,
+        random_state=random_state,
+        beta_cap=beta_cap,
+        rmin_quantile=rmin_quantile,
+    )
 
     t0 = time.perf_counter()
     model.fit(X_train, y_train)
@@ -45,6 +53,7 @@ def evaluate_one_config(
     total_candidates = 0
     total_tree_dcs = 0
     total_expansions = 0
+    empty_results = 0
 
     t0 = time.perf_counter()
     for q, yq in zip(X_test[:n_queries], y_test[:n_queries]):
@@ -60,7 +69,9 @@ def evaluate_one_config(
         total_tree_dcs += stats.distance_computations
         total_expansions += stats.expansions
 
-        if len(ids) > 0 and y_train[ids[0]] == yq:
+        if len(ids) == 0:
+            empty_results += 1
+        elif y_train[ids[0]] == yq:
             same_label_hits += 1
     query_time = time.perf_counter() - t0
 
@@ -81,15 +92,17 @@ def evaluate_one_config(
         "query_total_time_sec": query_time,
         "avg_query_ms": query_time / n_queries * 1000.0,
         "recall": float(np.mean(recall_vals)),
-        "overall_ratio": float(np.mean(ratio_vals)),
+        "overall_ratio": float(np.mean(ratio_vals)) if ratio_vals else float("inf"),
         "same_label_accuracy": same_label_hits / n_queries,
         "avg_candidates": total_candidates / n_queries,
         "avg_tree_distance_computations": total_tree_dcs / n_queries,
         "avg_expansions": total_expansions / n_queries,
+        "empty_result_rate": empty_results / n_queries,
         "alpha1": model.alpha1,
         "alpha2": model.alpha2,
         "beta": model.beta,
         "t": model.t,
+        "rmin_quantile": model.rmin_quantile,
     }
 
 
@@ -128,6 +141,8 @@ def main():
     parser.add_argument("--queries", type=int, default=200)
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--beta-cap", type=float, default=0.10)
+    parser.add_argument("--rmin-quantile", type=float, default=0.35)
     parser.add_argument("--out-dir", type=str, default="pm_lsh_outputs")
     args = parser.parse_args()
 
@@ -142,19 +157,27 @@ def main():
         for s in [3, 5, 7]:
             print(f"Running config: m={m}, pivots={s}")
             row = evaluate_one_config(
-                X_train, y_train, X_test, y_test,
+                X_train,
+                y_train,
+                X_test,
+                y_test,
                 m=m,
                 n_pivots=s,
                 c=1.5,
                 k=args.k,
                 n_queries=args.queries,
                 random_state=args.seed,
+                beta_cap=args.beta_cap,
+                rmin_quantile=args.rmin_quantile,
             )
             print(json.dumps(row, indent=2))
             configs.append(row)
 
     os.makedirs(args.out_dir, exist_ok=True)
-    df = pd.DataFrame(configs).sort_values(["recall", "overall_ratio", "avg_query_ms"], ascending=[False, True, True])
+    df = pd.DataFrame(configs).sort_values(
+        ["recall", "overall_ratio", "avg_candidates", "avg_query_ms"],
+        ascending=[False, True, True, True],
+    )
     csv_path = os.path.join(args.out_dir, "pm_lsh_results.csv")
     json_path = os.path.join(args.out_dir, "pm_lsh_best.json")
     df.to_csv(csv_path, index=False)
@@ -163,7 +186,20 @@ def main():
     plot_tradeoff(df, args.out_dir)
 
     print("\nTop configurations:")
-    print(df[["m", "n_pivots", "avg_query_ms", "recall", "overall_ratio", "avg_candidates"]].to_string(index=False))
+    print(
+        df[
+            [
+                "m",
+                "n_pivots",
+                "avg_query_ms",
+                "recall",
+                "overall_ratio",
+                "avg_candidates",
+                "avg_expansions",
+                "beta",
+            ]
+        ].to_string(index=False)
+    )
     print(f"\nSaved CSV:  {csv_path}")
     print(f"Saved JSON: {json_path}")
 

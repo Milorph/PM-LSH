@@ -38,16 +38,4 @@ python evaluate.py --train-size 15000 --test-size 2000 --queries 200 --k 10
 
 Outputs are saved under `pm_lsh_outputs/`.
 
-## What to say on a resume
 
-Safe wording:
-
-- Implemented a **PM-LSH-style approximate nearest neighbor search system** in Python for high-dimensional retrieval, using Gaussian projections, a PM-tree index, and confidence-interval-guided range expansion.
-- Evaluated recall, overall ratio, and query-time tradeoffs on MNIST against exact brute-force nearest neighbor search.
-
-Avoid claiming:
-
-- "Reproduced the exact original PM-LSH paper implementation"
-- "Implemented the authors' full experimental stack exactly"
-
-unless you truly match their datasets, parameter settings, baselines, and reported tables.

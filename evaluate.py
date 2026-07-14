@@ -15,7 +15,34 @@ from pm_lsh import PMLSH
 
 
 def overall_ratio(approx_dists: np.ndarray, exact_dists: np.ndarray) -> float:
-    return float(np.mean(approx_dists / (exact_dists + 1e-12)))
+    """Overall ratio as defined in the PM-LSH paper (Zheng et al., PVLDB 2020).
+
+        ratio = (1/k) * sum_i  Dist(o_i, q) / Dist(o_i*, q)
+
+    where o_i is the i-th nearest object returned by the method and o_i* is the
+    exact i-th NN. Both distance arrays are assumed sorted ascending so that
+    position i pairs the i-th approximate result with the i-th exact result.
+
+    If the method returns fewer than k results, we pair over the results that do
+    exist (a missing result cannot be scored as a finite ratio); the shortfall is
+    already captured by recall, so the two metrics together describe accuracy.
+    """
+    m = min(len(approx_dists), len(exact_dists))
+    if m == 0:
+        return float("nan")
+    a = np.asarray(approx_dists[:m], dtype=np.float64)
+    e = np.asarray(exact_dists[:m], dtype=np.float64)
+    return float(np.mean(a / (e + 1e-12)))
+
+
+def recall_at_k(approx_ids, exact_ids) -> float:
+    """Recall as defined in the PM-LSH paper: the fraction of the exact k NNs
+    that the method returns, i.e. |returned ∩ exact_kNN| / k.
+    """
+    k = len(exact_ids)
+    if k == 0:
+        return float("nan")
+    return len(set(int(i) for i in approx_ids) & set(int(i) for i in exact_ids)) / k
 
 
 def evaluate_one_config(
@@ -31,14 +58,18 @@ def evaluate_one_config(
     random_state,
     beta_cap,
     rmin_quantile,
+    max_expansions,
+    search_width,
 ):
     model = PMLSH(
         m=m,
         n_pivots=n_pivots,
         c=c,
+        search_width=search_width,
         random_state=random_state,
         beta_cap=beta_cap,
         rmin_quantile=rmin_quantile,
+        max_expansions=max_expansions,
     )
 
     t0 = time.perf_counter()
@@ -78,7 +109,7 @@ def evaluate_one_config(
     recall_vals = []
     ratio_vals = []
     for a_ids, e_ids, a_d, e_d in zip(approx_ids, exact_ids, approx_dists, exact_dists):
-        recall_vals.append(len(set(a_ids.tolist()) & set(e_ids.tolist())) / max(len(e_ids), 1))
+        recall_vals.append(recall_at_k(a_ids, e_ids))
         if len(a_d) > 0:
             ratio_vals.append(overall_ratio(a_d, e_d))
 
@@ -98,39 +129,63 @@ def evaluate_one_config(
         "avg_tree_distance_computations": total_tree_dcs / n_queries,
         "avg_expansions": total_expansions / n_queries,
         "empty_result_rate": empty_results / n_queries,
+        "search_width": model.search_width,
         "alpha1": model.alpha1,
+        "effective_alpha1": model.effective_alpha1,
         "alpha2": model.alpha2,
         "beta": model.beta,
         "t": model.t,
+        "effective_t": model.effective_t,
         "rmin_quantile": model.rmin_quantile,
     }
 
 
+def _annotate(df: pd.DataFrame, x: str, y: str) -> None:
+    for _, row in df.iterrows():
+        plt.annotate(f"w={row['search_width']:g}", (row[x], row[y]), fontsize=8)
+
+
 def plot_tradeoff(df: pd.DataFrame, out_dir: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
+    df = df.sort_values("search_width")
 
+    # Recall vs query time (the paper's accuracy/efficiency tradeoff).
     plt.figure(figsize=(7, 5))
-    plt.scatter(df["avg_query_ms"], df["recall"])
-    for _, row in df.iterrows():
-        plt.annotate(f"m={int(row['m'])},s={int(row['n_pivots'])}", (row["avg_query_ms"], row["recall"]), fontsize=8)
+    plt.plot(df["avg_query_ms"], df["recall"], marker="o")
+    _annotate(df, "avg_query_ms", "recall")
     plt.xlabel("Average Query Time (ms)")
-    plt.ylabel("Recall")
+    plt.ylabel("Recall@k")
     plt.title("PM-LSH Recall vs Query Time")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "recall_vs_time.png"), dpi=200)
     plt.close()
 
+    # Overall ratio vs query time.
     plt.figure(figsize=(7, 5))
-    plt.scatter(df["avg_query_ms"], df["overall_ratio"])
-    for _, row in df.iterrows():
-        plt.annotate(f"m={int(row['m'])},s={int(row['n_pivots'])}", (row["avg_query_ms"], row["overall_ratio"]), fontsize=8)
+    plt.plot(df["avg_query_ms"], df["overall_ratio"], marker="o")
+    _annotate(df, "avg_query_ms", "overall_ratio")
+    plt.axhline(1.0, color="gray", linestyle="--", alpha=0.6, label="ideal (ratio = 1)")
     plt.xlabel("Average Query Time (ms)")
     plt.ylabel("Overall Ratio")
     plt.title("PM-LSH Overall Ratio vs Query Time")
+    plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "ratio_vs_time.png"), dpi=200)
+    plt.close()
+
+    # Ratio vs recall: both accuracy metrics improve together as c -> 1.
+    plt.figure(figsize=(7, 5))
+    plt.plot(df["recall"], df["overall_ratio"], marker="o")
+    _annotate(df, "recall", "overall_ratio")
+    plt.axhline(1.0, color="gray", linestyle="--", alpha=0.6)
+    plt.xlabel("Recall@k")
+    plt.ylabel("Overall Ratio")
+    plt.title("PM-LSH Overall Ratio vs Recall (swept over confidence width)")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "ratio_vs_recall.png"), dpi=200)
     plt.close()
 
 
@@ -141,8 +196,16 @@ def main():
     parser.add_argument("--queries", type=int, default=200)
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--beta-cap", type=float, default=0.10)
+    parser.add_argument("--m", type=int, default=15, help="projected dimension (paper default ~15)")
+    parser.add_argument("--n-pivots", type=int, default=5)
+    parser.add_argument("--beta-cap", type=float, default=0.25,
+                        help="max candidate-budget fraction beta; larger => higher recall, slower")
     parser.add_argument("--rmin-quantile", type=float, default=0.35)
+    parser.add_argument("--max-expansions", type=int, default=25,
+                        help="range-expansion steps")
+    parser.add_argument("--c", type=float, default=1.5, help="approximation ratio c (ratio bound)")
+    parser.add_argument("--search-widths", type=float, nargs="+", default=[1.0, 1.25, 1.5, 2.0],
+                        help="confidence-net width multipliers to sweep; recall rises with width")
     parser.add_argument("--out-dir", type=str, default="pm_lsh_outputs")
     args = parser.parse_args()
 
@@ -152,26 +215,36 @@ def main():
         random_state=args.seed,
     )
 
+    # Sweep the confidence-net width at a fixed projected dimension m. This is the
+    # knob that actually traces the paper's accuracy/efficiency tradeoff: at the
+    # paper's default alpha1 = 1/e (width = 1.0) the chi-square net captures a true
+    # neighbor at the search radius with only ~1 - 1/e ~ 0.63 probability, so the
+    # range search misses ~37% of true NNs and recall saturates around 0.6-0.8.
+    # Widening the net (width > 1, i.e. a smaller effective alpha1 / larger t)
+    # pushes recall toward ~1.0 and ratio toward 1.0 at the cost of examining more
+    # candidates. The approximation ratio c only bounds the ratio and does not move
+    # recall, so it is held fixed here.
     configs: List[Dict[str, object]] = []
-    for m in [10, 15, 20]:
-        for s in [3, 5, 7]:
-            print(f"Running config: m={m}, pivots={s}")
-            row = evaluate_one_config(
-                X_train,
-                y_train,
-                X_test,
-                y_test,
-                m=m,
-                n_pivots=s,
-                c=1.5,
-                k=args.k,
-                n_queries=args.queries,
-                random_state=args.seed,
-                beta_cap=args.beta_cap,
-                rmin_quantile=args.rmin_quantile,
-            )
-            print(json.dumps(row, indent=2))
-            configs.append(row)
+    for width in args.search_widths:
+        print(f"Running config: m={args.m}, pivots={args.n_pivots}, c={args.c}, search_width={width}")
+        row = evaluate_one_config(
+            X_train,
+            y_train,
+            X_test,
+            y_test,
+            m=args.m,
+            n_pivots=args.n_pivots,
+            c=args.c,
+            k=args.k,
+            n_queries=args.queries,
+            random_state=args.seed,
+            beta_cap=args.beta_cap,
+            rmin_quantile=args.rmin_quantile,
+            max_expansions=args.max_expansions,
+            search_width=width,
+        )
+        print(json.dumps(row, indent=2))
+        configs.append(row)
 
     os.makedirs(args.out_dir, exist_ok=True)
     df = pd.DataFrame(configs).sort_values(
@@ -185,18 +258,18 @@ def main():
         json.dump(df.iloc[0].to_dict(), f, indent=2)
     plot_tradeoff(df, args.out_dir)
 
-    print("\nTop configurations:")
+    print("\nResults (sorted by recall):")
     print(
         df[
             [
                 "m",
-                "n_pivots",
+                "search_width",
+                "effective_alpha1",
                 "avg_query_ms",
                 "recall",
                 "overall_ratio",
                 "avg_candidates",
                 "avg_expansions",
-                "beta",
             ]
         ].to_string(index=False)
     )

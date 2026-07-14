@@ -27,6 +27,11 @@ class PMLSH:
     - keeps beta small by default so the search stays genuinely approximate
     - estimates r_min from sampled k-NN radii rather than random pairwise distances
     - allows multiple projected-space expansions before exact reranking
+    - exposes `search_width`, a multiplier on the chi-square confidence net; the
+      paper's default alpha1 = 1/e (search_width = 1.0) captures a true neighbor at
+      the search radius with only ~0.63 probability, so recall saturates around
+      0.6-0.8. Widening the net (search_width > 1) recovers recall toward ~1.0 at
+      the cost of examining more candidates -- the accuracy/efficiency tradeoff.
 
     It is still a research-style Python reimplementation, not the original C++ code.
     """
@@ -37,6 +42,7 @@ class PMLSH:
         n_pivots: int = 5,
         c: float = 1.5,
         alpha1: float = 1 / math.e,
+        search_width: float = 1.0,
         alpha2: Optional[float] = None,
         beta: Optional[float] = None,
         beta_cap: float = 0.10,
@@ -51,6 +57,7 @@ class PMLSH:
         self.n_pivots = int(n_pivots)
         self.c = float(c)
         self.alpha1 = float(alpha1)
+        self.search_width = float(search_width)
         self.random_state = int(random_state)
         self.rng = np.random.default_rng(random_state)
         self.max_leaf_size = int(max_leaf_size)
@@ -68,6 +75,12 @@ class PMLSH:
             self.beta = float(beta)
 
         self.t = float(math.sqrt(self._chi2_upper_quantile(self.m, self.alpha1)))
+        # Effective confidence net actually used at query time. search_width > 1
+        # widens the chi-square net beyond the alpha1 default, which is the knob
+        # that trades higher recall for more candidates examined. The effective
+        # per-projection miss probability is the chi-square upper-tail at t_eff^2.
+        self.effective_t = self.search_width * self.t
+        self.effective_alpha1 = float(chi2.sf(self.effective_t ** 2, self.m))
 
         self.X: Optional[np.ndarray] = None
         self.y: Optional[np.ndarray] = None
@@ -160,7 +173,7 @@ class PMLSH:
         return max(base * scale, 1e-8)
 
     def _projected_range_radius(self, original_radius: float) -> float:
-        return self.t * original_radius
+        return self.effective_t * original_radius
 
     def _finalize(self, q: np.ndarray, candidate_ids: List[int], k: int, stats: QueryStats) -> Tuple[np.ndarray, np.ndarray, QueryStats]:
         if self.X is None:

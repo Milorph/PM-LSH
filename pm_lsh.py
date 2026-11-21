@@ -46,7 +46,15 @@ class PMLSH:
         rmin_sample_size: int = 192,
         rmin_quantile: float = 0.35,
         max_expansions: int = 8,
+        search: str = "tree",
     ) -> None:
+        if search not in ("tree", "scan"):
+            raise ValueError("search must be 'tree' or 'scan'")
+        # "tree": projected-space range queries go through the PM-tree.
+        # "scan": the same range query answered by one vectorized pass over the
+        #         projected vectors. Both return exactly the points within the
+        #         projected radius, so candidates and results are the same.
+        self.search = search
         self.m = int(m)
         self.n_pivots = int(n_pivots)
         self.c = float(c)
@@ -112,6 +120,7 @@ class PMLSH:
         n, d = self.X.shape
         self.projection_matrix = self.rng.normal(0.0, 1.0, size=(self.m, d)).astype(np.float32)
         self.X_proj = self._project(self.X)
+        self.X_proj_sq = np.einsum("ij,ij->i", self.X_proj, self.X_proj)
 
         pivot_ids = self._choose_pivots(self.X_proj, self.n_pivots)
         self.pivots = self.X_proj[pivot_ids]
@@ -188,9 +197,17 @@ class PMLSH:
         best_ids = np.array([], dtype=np.int32)
         best_dists = np.array([], dtype=np.float32)
 
+        if self.search == "scan":
+            # squared projected distances to every point, computed once per query
+            # and reused across radius expansions
+            d2_proj = self.X_proj_sq - 2.0 * (self.X_proj @ q_proj) + float(q_proj @ q_proj)
+
         while expansions < self.max_expansions:
             last_proj_radius = self._projected_range_radius(r)
-            hits = self.tree.range_query(q_proj, last_proj_radius)
+            if self.search == "scan":
+                hits = np.nonzero(d2_proj <= last_proj_radius * last_proj_radius)[0].astype(np.int32)
+            else:
+                hits = self.tree.range_query(q_proj, last_proj_radius)
             new = hits[~seen[hits]]
             if len(new):
                 seen[new] = True
@@ -201,7 +218,7 @@ class PMLSH:
                 projected_radius=last_proj_radius,
                 original_radius=r,
                 candidates_found=len(candidate_ids),
-                distance_computations=self.tree.n_distance_computations,
+                distance_computations=(len(self.X) if self.search == "scan" else self.tree.n_distance_computations),
                 expansions=expansions,
             )
 
@@ -218,7 +235,7 @@ class PMLSH:
             projected_radius=last_proj_radius,
             original_radius=r,
             candidates_found=len(candidate_ids),
-            distance_computations=self.tree.n_distance_computations,
+            distance_computations=(len(self.X) if self.search == "scan" else self.tree.n_distance_computations),
             expansions=expansions,
         )
         return self._finalize(q, candidate_ids, k, final_stats)

@@ -162,14 +162,14 @@ class PMLSH:
     def _projected_range_radius(self, original_radius: float) -> float:
         return self.t * original_radius
 
-    def _finalize(self, q: np.ndarray, candidate_ids: List[int], k: int, stats: QueryStats) -> Tuple[np.ndarray, np.ndarray, QueryStats]:
+    def _finalize(self, q: np.ndarray, candidate_ids: np.ndarray, k: int, stats: QueryStats) -> Tuple[np.ndarray, np.ndarray, QueryStats]:
         if self.X is None:
             raise ValueError("Index not fit")
-        if not candidate_ids:
+        if len(candidate_ids) == 0:
             return np.array([], dtype=np.int32), np.array([], dtype=np.float32), stats
-        candidate_arr = np.array(candidate_ids, dtype=np.int32)
+        candidate_arr = np.asarray(candidate_ids, dtype=np.int32)
         dists = np.linalg.norm(self.X[candidate_arr] - q, axis=1)
-        order = np.argsort(dists)[:k]
+        order = np.argsort(dists, kind="stable")[:k]
         return candidate_arr[order], dists[order], stats
 
     def query_ckann(self, q: np.ndarray, k: int = 1) -> Tuple[np.ndarray, np.ndarray, QueryStats]:
@@ -181,8 +181,8 @@ class PMLSH:
         r = self._estimate_r_min(k)
         n_required = int(math.ceil(self.beta * len(self.X) + k))
 
-        candidate_ids: List[int] = []
-        seen: set[int] = set()
+        candidate_ids = np.empty(0, dtype=np.int32)
+        seen = np.zeros(len(self.X), dtype=bool)
         expansions = 0
         last_proj_radius = 0.0
         best_ids = np.array([], dtype=np.int32)
@@ -191,10 +191,10 @@ class PMLSH:
         while expansions < self.max_expansions:
             last_proj_radius = self._projected_range_radius(r)
             hits = self.tree.range_query(q_proj, last_proj_radius)
-            for idx in hits:
-                if idx not in seen:
-                    seen.add(idx)
-                    candidate_ids.append(idx)
+            new = hits[~seen[hits]]
+            if len(new):
+                seen[new] = True
+                candidate_ids = np.concatenate([candidate_ids, new])
 
             expansions += 1
             stats = QueryStats(
@@ -205,7 +205,7 @@ class PMLSH:
                 expansions=expansions,
             )
 
-            if candidate_ids:
+            if len(candidate_ids):
                 best_ids, best_dists, _ = self._finalize(q, candidate_ids, k, stats)
                 within = int(np.sum(best_dists <= self.c * r))
                 if len(candidate_ids) >= n_required or within >= k:

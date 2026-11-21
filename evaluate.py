@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from datasets import load_mnist, brute_force_topk
+from datasets import load_mnist, brute_force_topk, FastBruteForce
 from pm_lsh import PMLSH
 
 
@@ -55,8 +55,13 @@ def evaluate_one_config(
     total_expansions = 0
     empty_results = 0
 
+    fast_bf = FastBruteForce(X_train)
+    model.query_ckann(X_test[0], k=k)  # warm-up
+    fast_bf.query(X_test[0], k=k)
+
     query_time = 0.0
     brute_time = 0.0
+    fast_brute_time = 0.0
     for q, yq in zip(X_test[:n_queries], y_test[:n_queries]):
         t0 = time.perf_counter()
         ids, dists, stats = model.query_ckann(q, k=k)
@@ -65,6 +70,10 @@ def evaluate_one_config(
         t0 = time.perf_counter()
         bf_ids, bf_dists = brute_force_topk(X_train, q, k=k)
         brute_time += time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        fast_bf.query(q, k=k)
+        fast_brute_time += time.perf_counter() - t0
 
         approx_ids.append(ids)
         approx_dists.append(dists)
@@ -97,6 +106,7 @@ def evaluate_one_config(
         "query_total_time_sec": query_time,
         "avg_query_ms": query_time / n_queries * 1000.0,
         "avg_bruteforce_ms": brute_time / n_queries * 1000.0,
+        "avg_fast_bruteforce_ms": fast_brute_time / n_queries * 1000.0,
         "rerank_fraction": (total_candidates / n_queries) / len(X_train),
         "recall": float(np.mean(recall_vals)),
         "overall_ratio": float(np.mean(ratio_vals)) if ratio_vals else float("inf"),
@@ -200,6 +210,7 @@ def main():
                 "n_pivots",
                 "avg_query_ms",
                 "avg_bruteforce_ms",
+                "avg_fast_bruteforce_ms",
                 "recall",
                 "overall_ratio",
                 "avg_candidates",

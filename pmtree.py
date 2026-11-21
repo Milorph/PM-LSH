@@ -1,46 +1,47 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
 import math
 import numpy as np
 
 
-@dataclass
-class PMLeafEntry:
-    point_id: int
-    point: np.ndarray
-    parent_distance: float
-    pivot_distances: np.ndarray
+class PMLeaf:
+    """Leaf node: all entries stored as contiguous arrays so filters run vectorized."""
+
+    __slots__ = ("ids", "points", "pivot_distances")
+
+    def __init__(self, ids: np.ndarray, points: np.ndarray, pivot_distances: np.ndarray) -> None:
+        self.ids = ids                          # (k,)
+        self.points = points                    # (k, m)
+        self.pivot_distances = pivot_distances  # (k, s)
 
 
-@dataclass
-class PMInternalEntry:
-    routing_object: np.ndarray
-    child: "PMNode"
-    radius: float
-    parent_distance: float
-    hr_min: np.ndarray
-    hr_max: np.ndarray
+class PMInternal:
+    """Internal node: routing objects, covering radii and pivot hyper-rings as arrays."""
 
+    __slots__ = ("centers", "radii", "hr_min", "hr_max", "children")
 
-@dataclass
-class PMNode:
-    is_leaf: bool
-    entries: List[object] = field(default_factory=list)
+    def __init__(self, centers, radii, hr_min, hr_max, children) -> None:
+        self.centers = centers    # (c, m)
+        self.radii = radii        # (c,)
+        self.hr_min = hr_min      # (c, s)
+        self.hr_max = hr_max      # (c, s)
+        self.children = children  # list of length c
 
 
 class PMTree:
     """
-    A compact PM-tree style metric index for Euclidean search in projected space.
+    PM-tree style metric index for Euclidean range search in the projected space.
 
-    This is a research-project implementation intended to mirror the paper's core
-    ideas:
-    - pivot-aware pruning via hyper-ring bounds
-    - ball-partition / routing-object style nodes
-    - range-query support
+    Mirrors the paper's core ideas:
+    - ball-partition nodes with routing objects and covering radii
+    - pivot hyper-ring (HR) bounds on every subtree, used for pruning
+    - per-entry pivot distances at the leaves, used to skip exact distance checks
 
-    It is not a byte-for-byte reproduction of the authors' C++ implementation.
+    Each node stores its entries as NumPy arrays, so the ball filter, the HR
+    filters and the leaf checks for a whole node run as one vectorized
+    operation instead of a Python loop over entries. Pruning decisions are
+    identical to the per-entry formulation.
     """
 
     def __init__(
@@ -52,142 +53,107 @@ class PMTree:
         self.pivots = np.asarray(pivots, dtype=np.float32)
         self.max_leaf_size = int(max_leaf_size)
         self.max_internal_size = int(max_internal_size)
-        self.root: Optional[PMNode] = None
+        self.root = None
         self.n_distance_computations: int = 0
+        self.n_nodes_visited: int = 0
 
     def reset_stats(self) -> None:
         self.n_distance_computations = 0
+        self.n_nodes_visited = 0
 
-    def _dist(self, a: np.ndarray, b: np.ndarray) -> float:
-        self.n_distance_computations += 1
-        return float(np.linalg.norm(a - b))
-
+    # ------------------------------------------------------------------ build
     def build(self, points: np.ndarray) -> "PMTree":
         points = np.asarray(points, dtype=np.float32)
-        indexed = [(i, points[i]) for i in range(points.shape[0])]
-        self.root = self._build_recursive(indexed, parent_center=None)
+        ids = np.arange(points.shape[0], dtype=np.int32)
+        self.root = self._build_recursive(ids, points)
         return self
 
-    def _build_recursive(
-        self,
-        items: List[Tuple[int, np.ndarray]],
-        parent_center: Optional[np.ndarray],
-    ) -> PMNode:
-        if len(items) <= self.max_leaf_size:
-            entries: List[PMLeafEntry] = []
-            for idx, point in items:
-                pd = 0.0 if parent_center is None else float(np.linalg.norm(point - parent_center))
-                pivot_distances = np.linalg.norm(self.pivots - point, axis=1).astype(np.float32)
-                entries.append(PMLeafEntry(idx, point, pd, pivot_distances))
-            return PMNode(is_leaf=True, entries=entries)
+    def _pivot_dists(self, pts: np.ndarray) -> np.ndarray:
+        return np.linalg.norm(pts[:, None, :] - self.pivots[None, :, :], axis=2).astype(np.float32)
 
-        centers, groups = self._partition(items, self.max_internal_size)
-        entries: List[PMInternalEntry] = []
-        node = PMNode(is_leaf=False, entries=[])
-        for center, group in zip(centers, groups):
-            child = self._build_recursive(group, parent_center=center)
-            radius = 0.0
-            pts = np.stack([p for _, p in group], axis=0)
-            if len(group) > 0:
-                radius = float(np.max(np.linalg.norm(pts - center, axis=1)))
-            if parent_center is None:
-                parent_distance = 0.0
-            else:
-                parent_distance = float(np.linalg.norm(center - parent_center))
+    def _build_recursive(self, ids: np.ndarray, pts: np.ndarray):
+        if len(ids) <= self.max_leaf_size:
+            return PMLeaf(ids, pts, self._pivot_dists(pts))
 
-            all_pivot_dists = np.linalg.norm(self.pivots[None, :, :] - pts[:, None, :], axis=2)
-            hr_min = all_pivot_dists.min(axis=0).astype(np.float32)
-            hr_max = all_pivot_dists.max(axis=0).astype(np.float32)
-            entries.append(
-                PMInternalEntry(
-                    routing_object=center.astype(np.float32),
-                    child=child,
-                    radius=radius,
-                    parent_distance=parent_distance,
-                    hr_min=hr_min,
-                    hr_max=hr_max,
-                )
-            )
-        node.entries = entries
-        return node
+        centers, groups = self._partition(pts)
+        c_list, r_list, hmin, hmax, children = [], [], [], [], []
+        for center, g in zip(centers, groups):
+            g_pts = pts[g]
+            children.append(self._build_recursive(ids[g], g_pts))
+            c_list.append(center)
+            r_list.append(float(np.max(np.linalg.norm(g_pts - center, axis=1))))
+            pd = self._pivot_dists(g_pts)
+            hmin.append(pd.min(axis=0))
+            hmax.append(pd.max(axis=0))
+        return PMInternal(
+            np.stack(c_list).astype(np.float32),
+            np.asarray(r_list, dtype=np.float32),
+            np.stack(hmin).astype(np.float32),
+            np.stack(hmax).astype(np.float32),
+            children,
+        )
 
-    def _partition(
-        self,
-        items: List[Tuple[int, np.ndarray]],
-        max_children: int,
-    ) -> Tuple[List[np.ndarray], List[List[Tuple[int, np.ndarray]]]]:
-        pts = np.stack([p for _, p in items], axis=0)
-        n = len(items)
-        n_centers = min(max_children, max(2, math.ceil(n / self.max_leaf_size)))
+    def _partition(self, pts: np.ndarray) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+        n = pts.shape[0]
+        n_centers = min(self.max_internal_size, max(2, math.ceil(n / self.max_leaf_size)))
 
         # farthest-first seed selection
         centers_idx = [0]
         min_d = np.linalg.norm(pts - pts[0], axis=1)
         for _ in range(1, n_centers):
-            next_idx = int(np.argmax(min_d))
-            centers_idx.append(next_idx)
-            d = np.linalg.norm(pts - pts[next_idx], axis=1)
-            min_d = np.minimum(min_d, d)
+            nxt = int(np.argmax(min_d))
+            centers_idx.append(nxt)
+            min_d = np.minimum(min_d, np.linalg.norm(pts - pts[nxt], axis=1))
 
-        centers = [pts[i].copy() for i in centers_idx]
-        assignments = [[] for _ in centers]
-        for item in items:
-            point = item[1]
-            ds = [float(np.linalg.norm(point - c)) for c in centers]
-            assignments[int(np.argmin(ds))].append(item)
+        centers = pts[centers_idx].copy()
+        d = np.linalg.norm(pts[:, None, :] - centers[None, :, :], axis=2)
+        assign = np.argmin(d, axis=1)
 
-        # repair empty groups if any
-        non_empty = [(c, g) for c, g in zip(centers, assignments) if len(g) > 0]
-        centers = [c for c, _ in non_empty]
-        assignments = [g for _, g in non_empty]
-        return centers, assignments
+        out_c, out_g = [], []
+        for j in range(len(centers)):
+            g = np.nonzero(assign == j)[0]
+            if len(g) > 0:  # drop empty groups
+                out_c.append(centers[j])
+                out_g.append(g)
+        return out_c, out_g
 
-    def range_query(self, query: np.ndarray, radius: float) -> List[int]:
+    # ------------------------------------------------------------------ query
+    def range_query(self, query: np.ndarray, radius: float) -> np.ndarray:
         if self.root is None:
             raise ValueError("PM-tree not built")
         query = np.asarray(query, dtype=np.float32)
         self.reset_stats()
-        q_pivot_dists = np.linalg.norm(self.pivots - query, axis=1).astype(np.float32)
-        out: List[int] = []
-        self._range_recursive(self.root, query, radius, q_pivot_dists, out)
-        return out
+        q_pd = np.linalg.norm(self.pivots - query, axis=1).astype(np.float32)
+        lo = q_pd - radius
+        hi = q_pd + radius
 
-    def _passes_internal_filters(
-        self,
-        entry: PMInternalEntry,
-        query: np.ndarray,
-        radius: float,
-        q_pivot_dists: np.ndarray,
-    ) -> bool:
-        # Ball-overlap filter
-        if self._dist(query, entry.routing_object) > entry.radius + radius:
-            return False
-        # Pivot ring filters
-        if np.any(q_pivot_dists - radius > entry.hr_max):
-            return False
-        if np.any(q_pivot_dists + radius < entry.hr_min):
-            return False
-        return True
-
-    def _range_recursive(
-        self,
-        node: PMNode,
-        query: np.ndarray,
-        radius: float,
-        q_pivot_dists: np.ndarray,
-        out: List[int],
-    ) -> None:
-        if node.is_leaf:
-            for entry in node.entries:
-                assert isinstance(entry, PMLeafEntry)
-                # pivot filters on leaf point
-                if np.any(np.abs(q_pivot_dists - entry.pivot_distances) > radius):
+        out: List[np.ndarray] = []
+        stack = [self.root]
+        while stack:
+            node = stack.pop()
+            self.n_nodes_visited += 1
+            if isinstance(node, PMLeaf):
+                # pivot filter: |d(q,p) - d(o,p)| <= r for every pivot p
+                keep = np.all(np.abs(q_pd - node.pivot_distances) <= radius, axis=1)
+                if not keep.any():
                     continue
-                if self._dist(query, entry.point) <= radius:
-                    out.append(entry.point_id)
-            return
+                cand = node.points[keep]
+                self.n_distance_computations += cand.shape[0]
+                d = np.linalg.norm(cand - query, axis=1)
+                hit = d <= radius
+                if hit.any():
+                    out.append(node.ids[keep][hit])
+                continue
 
-        for entry in node.entries:
-            assert isinstance(entry, PMInternalEntry)
-            if self._passes_internal_filters(entry, query, radius, q_pivot_dists):
-                self._range_recursive(entry.child, query, radius, q_pivot_dists, out)
+            # ball-overlap filter + pivot hyper-ring filters for all children at once
+            self.n_distance_computations += node.centers.shape[0]
+            d = np.linalg.norm(node.centers - query, axis=1)
+            keep = d <= node.radii + radius
+            keep &= np.all(lo <= node.hr_max, axis=1)
+            keep &= np.all(hi >= node.hr_min, axis=1)
+            for j in np.nonzero(keep)[0]:
+                stack.append(node.children[j])
+
+        if not out:
+            return np.empty(0, dtype=np.int32)
+        return np.concatenate(out)

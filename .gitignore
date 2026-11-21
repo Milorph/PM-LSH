@@ -1,6 +1,3 @@
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
 .ipynb_checkpoints/
-pm_lsh_outputs/
